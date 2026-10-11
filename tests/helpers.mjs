@@ -12,6 +12,25 @@ export function tmpDir(prefix = 'fgs-dsh-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+/** 活动 Project 的 graph.yaml（M1 起图不再落在 `.fgs/graph.yaml`）。 */
+export function projectGraphPath(cwd, problemId = 'default', stateDir = '.fgs') {
+  return path.join(cwd, stateDir, 'projects', problemId, 'graph.yaml');
+}
+
+export function projectJsonPath(cwd, problemId = 'default', stateDir = '.fgs') {
+  return path.join(cwd, stateDir, 'projects', problemId, 'graph.json');
+}
+
+/** 建 Project 并切到它。已存在则 switch。 */
+export function ensureActiveProject(host, agent, problemId = 'default') {
+  const command = host.commands.find((item) => item.name === 'fgs') ?? host.commands[0];
+  const created = command.handler({ agent, rawInput: `new ${problemId}` });
+  if (created.kind === 'error') {
+    return command.handler({ agent, rawInput: `switch ${problemId}` });
+  }
+  return created;
+}
+
 export function makeFakeHost() {
   const tools = new Map();
   const guards = [];

@@ -107,7 +107,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'FGS_bar' },
             h('span', { className: 'FGS_dot' }),
             h('span', { className: 'FGS_role' }, 'FGS'),
-            h('span', { className: 'FGS_meta' }, '未启动 · /fgs init <brief> 或 fgs_seed')));
+            h('span', { className: 'FGS_meta' }, '未启动 · /fgs new <problemId> [brief]')));
       }
 
       const counts = snap.counts || {};

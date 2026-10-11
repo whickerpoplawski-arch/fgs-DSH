@@ -6,11 +6,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import path from 'node:path';
 
 import { apply as applyPlugin } from '../index.js';
 import { load } from '../yaml.js';
-import { makeFakeAgent, makeFakeHost, tmpDir, wireServices } from './helpers.mjs';
+import { ensureActiveProject, makeFakeAgent, makeFakeHost, projectGraphPath, projectJsonPath, tmpDir, wireServices } from './helpers.mjs';
 
 /** 固定轨迹：Decide(open×2) → Execute×2 → Decide(satisfy) → Decide(reopen)。 */
 const TRAJECTORY = [
@@ -45,6 +44,8 @@ function boot() {
   const cwd = tmpDir();
   const agent = makeFakeAgent('replay-session', cwd);
   host.emit('agent/created', { agent });
+  const created = ensureActiveProject(host, agent);
+  if (created.kind !== 'success') throw new Error(created.text);
   return { host, agent, cwd };
 }
 
@@ -89,7 +90,7 @@ async function replay(host, agent) {
 test('固定轨迹 replay：图与 canonical diff 完全一致', async () => {
   const { host, agent, cwd } = boot();
   await replay(host, agent);
-  const store = { graphPath: path.join(cwd, '.fgs', 'graph.yaml'), jsonPath: path.join(cwd, '.fgs', 'graph.json') };
+  const store = { graphPath: projectGraphPath(cwd), jsonPath: projectJsonPath(cwd) };
   const graph = load(fs.readFileSync(store.graphPath, 'utf8'));
   const mirror = JSON.parse(fs.readFileSync(store.jsonPath, 'utf8'));
 
@@ -155,14 +156,14 @@ test('固定轨迹 replay：图与 canonical diff 完全一致', async () => {
 test('replay 的第二个分支：reopen 后 satisfied* 清空并追加 feedback Fact', async () => {
   const { host, agent, cwd } = boot();
   await replay(host, agent);
-  const before = canonical(load(fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8')));
+  const before = canonical(load(fs.readFileSync(projectGraphPath(cwd), 'utf8')));
 
   const reopened = await host.callTool('fgs_reopen', { goalId: 'goal_final', reason: '外部判定 FLAG 无效，重做' }, agent);
   assert.equal(reopened.ok, true);
   const committed = await host.callTool('fgs_commit', {}, agent);
   assert.equal(committed.ok, true);
 
-  const after = canonical(load(fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8')));
+  const after = canonical(load(fs.readFileSync(projectGraphPath(cwd), 'utf8')));
   assert.equal(after.goals[0].satisfied, false);
   assert.equal(after.goals[0].satisfiedBy, null);
   assert.equal(after.facts.length, before.facts.length + 1);

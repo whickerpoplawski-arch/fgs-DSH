@@ -5,7 +5,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { apply as applyPlugin } from '../index.js';
-import { callRoute, makeFakeAgent, makeFakeHost, tmpDir, wireServices } from './helpers.mjs';
+import {
+  callRoute,
+  ensureActiveProject,
+  makeFakeAgent,
+  makeFakeHost,
+  projectGraphPath,
+  tmpDir,
+  wireServices,
+} from './helpers.mjs';
 
 const FLAG = 'FLAG{dsh_native_ok}';
 
@@ -31,6 +39,8 @@ function boot(overrides = {}) {
 }
 
 async function seed(host, agent, brief = '{\"target\":\"http://10.0.0.8:8080\",\"hint\":\"拿 FLAG\"}') {
+  const created = ensureActiveProject(host, agent);
+  assert.equal(created.kind, 'success', JSON.stringify(created));
   const result = await host.callTool('fgs_seed', { brief, target: 'http://10.0.0.8:8080' }, agent);
   assert.equal(result.ok, true, result.text);
   return result;
@@ -60,8 +70,12 @@ test('注册了 systemPrompt 规则段、运行时上下文、/fgs 命令与 HTT
   assert.equal(host.routes[0].path, '/fgs/state');
 });
 
-test('未启动 FGS 时 guard 拦住规划/执行工具，但放开 fgs_seed', async () => {
+test('未启动 FGS 时 guard 拦住规划/执行工具；有活动 Project 后才放开 fgs_seed', async () => {
   const { host, agent } = boot();
+  const blocked = await host.callTool('fgs_seed', { brief: 'x' }, agent);
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.text, /没有活动 Project/);
+  ensureActiveProject(host, agent);
   const seedResult = await host.callTool('fgs_seed', { brief: 'x' }, agent);
   assert.equal(seedResult.ok, true);
   const { agent: other } = { agent: makeFakeAgent('sess-2', tmpDir()) };
@@ -130,15 +144,15 @@ test('角色隔离只靠 tools.guard，不依赖 tools.restrict 的动态可见�
 test('Decide 草稿 → commit 批量落盘；未 commit 前磁盘不变', async () => {
   const { host, agent, cwd } = boot();
   await seed(host, agent);
-  const before = fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8');
+  const before = fs.readFileSync(projectGraphPath(cwd), 'utf8');
   await host.callTool('fgs_open_step', { action: 'a', from: ['fact_origin'] }, agent);
   await host.callTool('fgs_open_step', { action: 'b', from: ['fact_origin'] }, agent);
-  assert.equal(fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8'), before, '草稿阶段不得落盘');
+  assert.equal(fs.readFileSync(projectGraphPath(cwd), 'utf8'), before, '草稿阶段不得落盘');
 
   const committed = await host.callTool('fgs_commit', {}, agent);
   assert.equal(committed.ok, true);
   assert.match(committed.text, /已提交 2 项/);
-  const graph = fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8');
+  const graph = fs.readFileSync(projectGraphPath(cwd), 'utf8');
   assert.match(graph, /step_001/);
   assert.match(graph, /step_002/);
 });
@@ -191,7 +205,7 @@ test('FLAG verify 失败时 satisfy_goal 整批拒写，不写 satisfied*', asyn
   const committed = await host.callTool('fgs_commit', {}, agent);
   assert.equal(committed.ok, false);
   assert.match(committed.text, /verify hook 拒绝/);
-  assert.doesNotMatch(fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8'), /satisfiedAt/);
+  assert.doesNotMatch(fs.readFileSync(projectGraphPath(cwd), 'utf8'), /satisfiedAt/);
 });
 
 test('完整一轮：Execute 收束 → 回 Decide → satisfy → concludeTurn 且停止', async () => {
@@ -231,7 +245,7 @@ test('Execute 轮无产出也强制落一条观察 Fact（CONTRACT §5）', asyn
   }, agent);
   const closed = await host.callTool('fgs_commit_step', {}, agent);
   assert.equal(closed.ok, true);
-  const graph = fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8');
+  const graph = fs.readFileSync(projectGraphPath(cwd), 'utf8');
   assert.match(graph, /观察/);
   assert.match(graph, /fact_001/);
 });
@@ -246,12 +260,12 @@ test('reopen 走 /fgs 命令：清空 satisfied* 并追加 feedback Fact', async
   await host.callTool('fgs_commit_step', {}, agent);
   await host.callTool('fgs_satisfy_goal', { goalId: 'goal_final', reason: 'ok', satisfiedBy: ['fact_001'] }, agent);
   await host.callTool('fgs_commit', {}, agent);
-  assert.match(fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8'), /satisfiedAt/);
+  assert.match(fs.readFileSync(projectGraphPath(cwd), 'utf8'), /satisfiedAt/);
 
   const command = host.commands[0];
   const result = command.handler({ agent, rawInput: 'reopen 裁判打回: 假 FLAG', commandId: 'c1' });
   assert.equal(result.kind, 'success', JSON.stringify(result));
-  const graph = fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8');
+  const graph = fs.readFileSync(projectGraphPath(cwd), 'utf8');
   assert.doesNotMatch(graph, /satisfiedAt/);
   assert.match(graph, /假 FLAG/);
 });
@@ -337,7 +351,8 @@ test('HTTP /fgs/state 返回给 Web 面板的快照', async () => {
   assert.equal(response.json.active, true);
   assert.equal(response.json.role, 'decide');
   assert.equal(response.json.counts.facts, 1);
-  assert.equal(response.json.root, path.join(cwd, '.fgs'));
+  assert.equal(response.json.root, path.join(cwd, '.fgs', 'projects', 'default'));
+  assert.equal(response.json.problemId, 'default');
   assert.equal(response.headers['content-type'], 'application/json; charset=utf-8');
 });
 
