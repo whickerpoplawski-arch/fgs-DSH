@@ -1,0 +1,8 @@
+# FGS 黑板插件（Host 半 + Client 半由 dsh.client 自动装载）
+- insert:
+    - id: fgs-deepseek
+      name: '@local/fgs-deepseek-dsh'
+      config:
+        stateDir: .fgs
+        verifyMode: regex
+        flagPattern: 'FLAG\{[^}\s]{4,}\}'
