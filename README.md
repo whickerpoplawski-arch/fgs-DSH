@@ -23,17 +23,21 @@ Client 半由 `package.json` 的 `dsh.client` 自动装载。
 
 | 命令 | 作用 |
 |---|---|
-| `/fgs init <brief>` | 种题：写 `fact_origin` + `goal_final`，启动本次运行 |
-| `/fgs status` | 角色 / facts / steps / open 数 / satisfied |
-| `/fgs graph` | 打印当前图投影（fact 仅 id+title） |
-| `/fgs path` | 打印 `graph.yaml` 路径 |
-| `/fgs reopen <原因>` | 打回：清空 `satisfied*` + 追加 feedback Fact |
-| `/fgs off` | 退出本次运行（图文件保留） |
+| `/fgs new <problemId> [brief]` | 建一道题的 Project（独立图 + `workspace/`）。给了 brief 就同时种题，并切为活动题 |
+| `/fgs switch <problemId>` | 切换活动题。之后的图工具、`/fgs status` 和 `/fgs/state` 都走这道题 |
+| `/fgs list` | 列出全部题：id / title / 派生角色 / open / satisfied / state。`*` 是活动题 |
+| `/fgs init <brief>` | 兼容别名：等价 `/fgs new default <brief>` |
+| `/fgs status` | 活动题的角色 / facts / steps / open 数 / satisfied |
+| `/fgs graph` | 打印活动题的图投影（fact 仅 id+title） |
+| `/fgs path` | 打印活动题的 `graph.yaml` 路径 |
+| `/fgs reopen <原因>` | 打回活动题：清空 `satisfied*` + 追加 feedback Fact |
+| `/fgs off` | 退出本会话在活动题上的运行（图文件保留） |
 
 ### 模型工具（角色自动切换 + 隔离）
 
-角色由图状态推导：**有 open step → Execute，否则 Decide**；没有 active run 时只有
-`fgs_seed` / `fgs_status` 可用（其余 `fgs_*` 被 guard 拒）。
+角色由图状态推导：**有 open step → Execute，否则 Decide**。没有活动 Project 时，
+改图工具（含 `fgs_seed`）被 guard 拒，只放只读 `fgs_status`。先 `/fgs new` 或
+`/fgs switch`。活动题已建但还没种题时，只有 `fgs_seed` / `fgs_status` 可用。
 
 - 控制面：`fgs_seed`、`fgs_status`
 - Decide：`fgs_open_step`、`fgs_drop_step`、`fgs_change_step_priority`、`fgs_preview`、
@@ -64,7 +68,7 @@ cordis.patch.yml            # 插入 Host 行
 index.js                    # Host 半：服务、11 个工具、角色门、命令、上下文、HTTP 快照
 client.js                   # Client 半：conversation.input.dock 只读黑板条
 yaml.js                     # FGS 图 YAML 子集读写（无外部依赖）
-controller/                 # 单写者：ops.js（Op 定义）+ index.js（GraphStore/Controller）
+controller/                 # 单写者：ops.js + index.js（GraphStore/Controller）+ projects.js（ProjectRegistry）
 hooks/                      # validate_write（写图预检）/ flag_verify（FLAG 硬门）/ sync_context
 env/windows.js              # WSL/PowerShell 规范化（CONTRACT §11）
 fixtures/                   # golden：origin-only / mid-graph / post-satisfy
@@ -76,11 +80,27 @@ tests/                      # node --test（离线，无外部依赖）
 
 ## 数据
 
-图落 `<workspace>/.fgs/`（CLI 可用 `stateDir` 配置改名）：
+一场比赛 = 一个 workspace 根（CLI 可用 `stateDir` 配置改名，默认 `.fgs`）。
+一道题 = 一个 Project，图和 Execute 工作目录按题隔离，不共用一张图：
 
-- `graph.yaml` — **主真相**，顶层键仅 `facts` → `goals` → `steps`
-- `graph.json` — 同构镜像（Atomics：先写 tmp + fsync 再 rename）
-- `graph.lock` — 写锁（陈旧锁 10s 自愈）
+```
+<workspace>/.fgs/
+  competition.json                 # problems[] + activeProblemId
+  graph.yaml.bak                   # 仅旧布局迁移后留下的备份
+  projects/<problemId>/
+    graph.yaml                     # 该题主真相，顶层键仅 facts → goals → steps
+    graph.json                     # 同构镜像（先写 tmp + fsync 再 rename）
+    graph.lock                     # 该题写锁（陈旧锁 10s 自愈）
+    meta.json                      # state / model / budget / roundSeq / createdAt
+    workspace/                     # 该题 Execute 产物目录
+```
+
+`problemId` 会规范成 `[a-z0-9_-]{1,64}`（非法字符变成 `_`）。重复 id 拒绝创建。
+内存里的 run 以 `(sessionId, problemId)` 为键：草稿、角色、`roundSeq` 都随题分开。
+「一轮只收束一个 open step」比对的是本 run 的 `roundSeq`，不是全局 DSH turn。
+
+若磁盘上还是旧的单图 `.fgs/graph.yaml`、且还没有 `projects/`，第一次访问会把它迁到
+`projects/default/`（原文件留 `.bak`），并把 `default` 设为活动题。
 
 ## 配置（`cordis.patch.yml` 的 `config`）
 
@@ -122,7 +142,7 @@ fail-closed 回退到 regex。要放行请把 `flagPattern` 显式设宽——�
 | §2 图序列化唯一真源 | `yaml.js` + `GraphStore.load/save`；非法顶层键直接拒读；ID 规则进 validate |
 | §3 单写者 Controller | `controller/index.js`；写路径先 `hooks/validate_write.preflight`（有计数器证明调用） |
 | §4 Decide 白名单 / 禁环境工具 | 白名单（`decideAllowTools`）：默认只留规划工具 + 元工具，bash/文件/网络/subagent/workflow 全拒 |
-| §5 Execute 收束 | 一轮只吃一个 open step（按 `turnBoundary` 计回合）；回合收口强制观察 Fact |
+| §5 Execute 收束 | 一轮只吃一个 open step（按本 Project run 的 `roundSeq`；宿主 turn 只推进这一题的计数）；回合收口强制观察 Fact |
 | §6 reopen | 清空 `satisfied*` + feedback Fact，永不删历史 |
 | §7 Fact 蒸馏 | title ≤120 字；content 超阈值必须是路径 |
 | §8 因果 + satisfy 硬门 | `from` 非空、`producedBy` 必填、verify hook 前置 |
@@ -137,7 +157,7 @@ cd /mnt/d/XunLei/med-lora/fgs-deepseek-DSH
 node --test "tests/*.test.mjs"
 ```
 
-覆盖：YAML 往返与真实 `cordis.patch.yml`、Controller 全部拒写路径（空 `from` /
+覆盖：Project 建题/切换/列表、两题图与草稿隔离、旧单图迁移、无活动 Project 时拒改图、YAML 往返与真实 `cordis.patch.yml`、Controller 全部拒写路径（空 `from` /
 缺 `reason` / 缺 `satisfy_goal` 字段 / 超长 fact / 无 `producedBy` / 非 open step /
 FLAG verify 失败不落盘 / reopen 清空且不删历史）、角色隔离与 Decide 白名单、回合语义
 （一轮一个 step、回合收口强制观察 Fact）、显式 stepId 不许换 step、`/fgs` 命令、
@@ -147,4 +167,4 @@ FLAG verify 失败不落盘 / reopen 清空且不删历史）、角色隔离与 
 
 > ⚠️ 改动 `index.js` 后**必须重启 Harness 进程**才会加载新模块代次
 > （`set_plugin` / 重装 bundle 都不会换掉已加载的 JS 模块；`/fgs/state` 返回的
-> `pluginGeneration` 可用来确认当前跑的是哪一代）。
+> `pluginGeneration` 可用来确认当前跑的是哪一代；M1 为代次 **4**，`buildTag` 含 `+project`）。

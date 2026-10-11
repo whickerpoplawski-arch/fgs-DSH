@@ -6,14 +6,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import path from 'node:path';
 
 import { apply as applyPlugin } from '../index.js';
 import { Controller, GraphStore } from '../controller/index.js';
 import { seedOriginOp, submitFactOp } from '../controller/ops.js';
 import { preflight, preflightStats } from '../hooks/validate_write.js';
 import { dropStepOp } from '../controller/ops.js';
-import { callRoute, makeFakeAgent, makeFakeHost, tmpDir, wireServices } from './helpers.mjs';
+import {
+  callRoute,
+  ensureActiveProject,
+  makeFakeAgent,
+  makeFakeHost,
+  projectGraphPath,
+  projectJsonPath,
+  tmpDir,
+  wireServices,
+} from './helpers.mjs';
 
 function boot(overrides = {}) {
   const host = makeFakeHost();
@@ -38,6 +46,8 @@ function boot(overrides = {}) {
 }
 
 async function seed(host, agent) {
+  const created = ensureActiveProject(host, agent);
+  assert.equal(created.kind, 'success', JSON.stringify(created));
   const result = await host.callTool('fgs_seed', { brief: '{"target":"http://x"}' }, agent);
   assert.equal(result.ok, true, result.text);
 }
@@ -118,14 +128,14 @@ test('§5：回合收口时没调用 commit_step，也会强制落一条观察 F
   // 模型直接结束回合（没有 commit_step）
   host.emit('agent/turn-stopping', { agent, turn: 3 });
 
-  const graph = fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8');
+  const graph = fs.readFileSync(projectGraphPath(cwd), 'utf8');
   assert.match(graph, /半成品草稿/, '草稿里的内容应被强制收束，而不是丢掉');
   assert.doesNotMatch(graph, /state: "open"/, 'step 必须被收束');
 
   // 同一回合再触发一次不会重复写
-  const before = fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8');
+  const before = fs.readFileSync(projectGraphPath(cwd), 'utf8');
   host.emit('agent/turn-stopping', { agent, turn: 3 });
-  assert.equal(fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8'), before);
+  assert.equal(fs.readFileSync(projectGraphPath(cwd), 'utf8'), before);
 });
 
 test('§5：完全没有 submit_fact 时，回合收口强制写观察 Fact', async () => {
@@ -136,7 +146,7 @@ test('§5：完全没有 submit_fact 时，回合收口强制写观察 Fact', as
   }, agent);
   host.ctx.setTurn(11);
   host.emit('agent/turn-stopping', { agent, turn: 11 });
-  assert.match(fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8'), /观察/);
+  assert.match(fs.readFileSync(projectGraphPath(cwd), 'utf8'), /观察/);
 });
 
 test('§5：显式 stepId 换 step 会被拒，不再静默改到别的 step', async () => {
@@ -299,7 +309,7 @@ test('§5：本轮刚打开的 step 不会在回合收口被吞成观察 Fact（
 
   // 同一回合收口：不得写任何 Fact，step 必须保持 open 留给下一回合
   host.emit('agent/turn-stopping', { agent, turn: 5 });
-  const graphPath = path.join(cwd, '.fgs', 'graph.yaml');
+  const graphPath = projectGraphPath(cwd);
   let graph = fs.readFileSync(graphPath, 'utf8');
   assert.match(graph, /state: "open"/, '刚打开的 step 必须留给下一回合，不能被吞掉');
   assert.doesNotMatch(graph, /观察/, '不得为「刚打开、还没执行」的 step 写观察 Fact');
@@ -326,7 +336,7 @@ test('§5：跨回合后仍然会为「没人做」的旧 step 补观察 Fact（
   host.emit('agent/turn-stopping', { agent, turn: 5 });
   host.ctx.setTurn(6);
   host.emit('agent/turn-stopping', { agent, turn: 6 });
-  const graph = fs.readFileSync(path.join(cwd, '.fgs', 'graph.yaml'), 'utf8');
+  const graph = fs.readFileSync(projectGraphPath(cwd), 'utf8');
   assert.match(graph, /无有效产出（观察）/);
   assert.doesNotMatch(graph, /state: "open"/);
 });
@@ -345,8 +355,8 @@ test('§9：图文件被移除后快照报 active:false，不再渲染成 execut
   assert.ok(before.json.buildTag, '快照必须带 buildTag，重启后一眼确认代码生效');
 
   // 绕过插件删掉图文件（本轮 live 实测就是这一步让面板陷入矛盾状态）
-  fs.rmSync(path.join(cwd, '.fgs', 'graph.yaml'), { force: true });
-  fs.rmSync(path.join(cwd, '.fgs', 'graph.json'), { force: true });
+  fs.rmSync(projectGraphPath(cwd), { force: true });
+  fs.rmSync(projectJsonPath(cwd), { force: true });
 
   const after = await callRoute(host.routes[0], '/fgs/state?sessionId=sess-audit');
   assert.equal(after.json.active, false, '空图必须按「未启动」上报，而不是 execute + 0/0/0');
@@ -365,7 +375,7 @@ test('§9：快照角色从图推导，不报内存缓存值', async () => {
     operations: [{ op: 'open_step', action: 'x', from: ['fact_origin'] }],
   }, agent);
   // 绕过插件直接改图：把唯一的 open step 标成 done（模拟图被外部改动）
-  const graphPath = path.join(cwd, '.fgs', 'graph.yaml');
+  const graphPath = projectGraphPath(cwd);
   fs.writeFileSync(
     graphPath,
     fs.readFileSync(graphPath, 'utf8').replace('state: "open"', 'state: "done"'),

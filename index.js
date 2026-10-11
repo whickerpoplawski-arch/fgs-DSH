@@ -7,8 +7,10 @@
  *   - Decide / Execute 双 toolset，按图状态自动切换角色并物理隔离（CONTRACT §4、§5）
  *   - 每步运行时上下文注入最新图投影（hooks/sync_context，CONTRACT §9）
  *
- * 会话 ≠ 项目：图落 workspace 的 `.fgs/`，与模型会话无关。
+ * 会话 ≠ 项目：一场比赛落在 workspace 的 `.fgs/`，每道题一个
+ * `.fgs/projects/<problemId>/`（独立图、workspace、run）。
  */
+import fs from 'node:fs';
 import path from 'node:path';
 import { readFileSync } from 'node:fs';
 
@@ -17,6 +19,7 @@ import {
   GraphStore,
   WriteRejected,
 } from './controller/index.js';
+import { ProjectRegistry } from './controller/projects.js';
 import {
   changePriorityOp,
   dropStepOp,
@@ -39,7 +42,7 @@ export const name = 'fgs-deepseek';
  * 运行代次标记：只用于确认「磁盘上的新代码是否已被 Host 真正加载」。
  * 改代码后如果 /fgs/state 报的还是旧代次，说明进程仍跑着旧模块（需要重启/重载）。
  */
-export const PLUGIN_GENERATION = 3;
+export const PLUGIN_GENERATION = 4;
 
 /**
  * 面向人的构建标识：每次改动都必须往上滚一格。
@@ -47,7 +50,7 @@ export const PLUGIN_GENERATION = 3;
  * 之后再改代码，重启前后代次相同就区分不出新旧了（本项目踩过一次）。
  * `/fgs/state` 会原样返回 buildTag，重启后 curl 一眼即可确认新代码生效。
  */
-export const BUILD_TAG = '3+fgs-draft-visible+stepsOpened-guard+snapshot-role';
+export const BUILD_TAG = '4+fgs-draft-visible+stepsOpened-guard+snapshot-role+project';
 
 /** 本插件只硬依赖 tools；其余服务可选接入。 */
 export const inject = ['tools'];
@@ -129,7 +132,8 @@ const FGS_RULES = [
   '## FGS 黑板（fgs-deepseek）',
   '',
   '本项目使用 FGS 黑板：事实(Fact) → 步骤(Step) → 新事实(Fact)。Goal 不连边，只被 satisfy_goal 引用。',
-  '图是唯一真记忆，存在 workspace 的 .fgs/graph.yaml；顶层键只有 facts/goals/steps。',
+  '图是唯一真记忆，按题隔离在 workspace 的 .fgs/projects/<problemId>/graph.yaml；顶层键只有 facts/goals/steps。',
+  '换题用 /fgs new <problemId> 或 /fgs switch <problemId>；没有活动 Project 时不能改图。',
   '',
   '角色由图的 open step 自动决定，工具集随之切换（越权调用在 dispatch 层被硬拒）：',
   '- 无 open step → Decide：只做规划/改图。除规划类工具与少量元工具外一律被拒，',
@@ -188,13 +192,42 @@ function toolResultSchema() {
 
 /* ---------------------------------------------------------- run 状态管理 */
 
-function createRun(agent, cfg) {
-  const root = path.resolve(cwdOf(agent), cfg.stateDir);
+function fgsRootOf(agent, cfg) {
+  return path.resolve(cwdOf(agent), cfg.stateDir);
+}
+
+function hasCwd(agent) {
+  return Boolean(agent?.session?.header?.cwd || agent?.cwd);
+}
+
+/** run 以 (sessionId, problemId) 为键，题与题的草稿/角色/回合互不共享。 */
+function runKey(sessionId, problemId) {
+  return `${sessionId}::${problemId}`;
+}
+
+function registryFor(agent, cfg, registries) {
+  if (!hasCwd(agent)) return null;
+  const root = fgsRootOf(agent, cfg);
+  let registry = registries.get(root);
+  if (!registry) {
+    registry = new ProjectRegistry(root);
+    registry.migrateLegacy();
+    registries.set(root, registry);
+  }
+  return registry;
+}
+
+function createRun(agent, cfg, registry, problemId) {
+  const root = registry.projectRoot(problemId);
+  fs.mkdirSync(path.join(root, 'workspace'), { recursive: true });
   const store = new GraphStore(root, cfg);
   const controller = new Controller(store, { verifyHook: makeVerifyHook(cfg) });
   return {
     sid: sessionIdOf(agent),
+    problemId,
     root,
+    fgsRoot: registry.root,
+    workspaceDir: path.join(root, 'workspace'),
     store,
     controller,
     role: 'decide',
@@ -203,20 +236,84 @@ function createRun(agent, cfg) {
     currentStepId: null,
     reachable: false,
     touchedAt: Date.now(),
+    roundSeq: 0,
+    roundTurn: null,
+    lastCommitRound: null,
+    stepsOpenedRound: null,
+    stepsOpenedIds: null,
   };
 }
 
-function runFor(agent, cfg, runs, create = false) {
-  const sid = sessionIdOf(agent);
-  let run = runs.get(sid);
+/**
+ * problemId 省略时取活动 Project。没有活动 Project 返回 null
+ * （改图必须先 /fgs new 或 /fgs switch）。
+ */
+function runFor(agent, cfg, runs, registries, create = false, problemId = undefined) {
+  const registry = registryFor(agent, cfg, registries);
+  if (!registry) return null;
+  const explicit = problemId !== undefined && problemId !== null && String(problemId) !== '';
+  const id = explicit ? registry.normalizeId(problemId) : registry.getActive();
+  if (!id || !registry.isValidId(id) || !registry.exists(id)) return null;
+  const key = runKey(sessionIdOf(agent), id);
+  let run = runs.get(key);
   if (run) {
     run.touchedAt = Date.now();
     return run;
   }
   if (!create) return null;
-  run = createRun(agent, cfg);
-  runs.set(sid, run);
+  run = createRun(agent, cfg, registry, id);
+  // 磁盘上可能已有图（迁移 / 重启后再 seed）：角色以图为准，不停留在默认 decide。
+  try {
+    refreshRole(run);
+  } catch {
+    /* 图损坏时仍交出 run，后续读会报错 */
+  }
+  runs.set(key, run);
   return run;
+}
+
+/**
+ * 把宿主 turn 折进「本 run 自己的 roundSeq」。
+ * 比对「一轮一步」只用 roundSeq，不拿全局 turn 数字当共享轴（G8）：
+ * 同一会话里两道题即使看到同一个 turn，也各有各的 roundSeq / lastCommitRound。
+ * turn 不可用时 limited=false，退化为不按回合硬拦（与旧行为一致）。
+ * 方案 B 会改由编排器显式 +1；M1 仍用宿主 turn 作为本 run 的时钟输入。
+ */
+function observeRound(run, turn) {
+  if (!Number.isFinite(turn)) return { round: run.roundSeq ?? 0, limited: false };
+  if (run.roundTurn === null || run.roundTurn === undefined) {
+    run.roundTurn = turn;
+  } else if (run.roundTurn !== turn) {
+    run.roundSeq = (run.roundSeq ?? 0) + 1;
+    run.roundTurn = turn;
+  }
+  return { round: run.roundSeq, limited: true };
+}
+
+function deriveProjectState(graph) {
+  if (goalSatisfied(graph)) return 'solved';
+  const facts = graph?.facts ?? [];
+  const steps = graph?.steps ?? [];
+  if (!facts.some((f) => f.id === 'fact_origin')) return 'created';
+  if (steps.length === 0) return 'seeded';
+  return 'running';
+}
+
+function syncProjectMeta(registry, run, graph) {
+  if (!registry || !run) return;
+  const state = deriveProjectState(graph);
+  const prev = registry.readMeta(run.problemId) ?? {};
+  registry.writeMeta(run.problemId, {
+    id: run.problemId,
+    title: prev.title ?? run.problemId,
+    state,
+    model: prev.model ?? null,
+    budget: prev.budget ?? null,
+    roundSeq: run.roundSeq ?? 0,
+    createdAt: prev.createdAt ?? new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+  registry.setProblemState(run.problemId, state);
 }
 
 function lastRun(runs) {
@@ -225,6 +322,81 @@ function lastRun(runs) {
     if (best === null || run.touchedAt > best.touchedAt) best = run;
   }
   return best;
+}
+
+function runsForSession(runs, sid) {
+  const found = [];
+  for (const run of runs.values()) {
+    if (run.sid === sid) found.push(run);
+  }
+  return found;
+}
+
+function liveRun(runs, { sid, fgsRoot, problemId }) {
+  let best = null;
+  for (const run of runs.values()) {
+    if (problemId && run.problemId !== problemId) continue;
+    if (fgsRoot && run.fgsRoot !== fgsRoot) continue;
+    if (sid && run.sid !== sid) continue;
+    if (best === null || run.touchedAt > best.touchedAt) best = run;
+  }
+  return best;
+}
+
+/** 没有内存 run 时按磁盘图做只读快照（草稿为空）。 */
+function diskSnapshot(registry, problemId, cfg) {
+  const store = new GraphStore(registry.projectRoot(problemId), cfg);
+  const meta = registry.readMeta(problemId);
+  return graphSnapshot({
+    sid: null,
+    problemId,
+    root: store.root,
+    fgsRoot: registry.root,
+    workspaceDir: path.join(store.root, 'workspace'),
+    roundSeq: meta?.roundSeq ?? 0,
+    store,
+    reachable: false,
+    currentStepId: null,
+    decideDraft: [],
+    execDraft: null,
+    role: 'decide',
+  });
+}
+
+function resolveHttpSnapshot({ runs, registries, cfg, sessionId, problemId }) {
+  const sid = sessionId || null;
+  const sessionRuns = sid ? runsForSession(runs, sid) : [];
+  if (sid && sessionRuns.length === 0) return inactivePayload();
+
+  let registry = null;
+  if (sessionRuns.length > 0) registry = registries.get(sessionRuns[0].fgsRoot) ?? null;
+  if (!registry) {
+    const latest = lastRun(runs);
+    if (latest) registry = registries.get(latest.fgsRoot) ?? null;
+  }
+  if (!registry) {
+    for (const candidate of registries.values()) {
+      if (candidate.getActive()) registry = candidate;
+    }
+  }
+
+  if (problemId) {
+    if (!registry) return inactivePayload();
+    const id = registry.normalizeId(problemId);
+    if (!registry.isValidId(id) || !registry.exists(id)) return inactivePayload();
+    const run = liveRun(runs, { sid, fgsRoot: registry.root, problemId: id });
+    return run ? graphSnapshot(run) : diskSnapshot(registry, id, cfg);
+  }
+
+  const activeId = registry?.getActive() ?? null;
+  if (activeId) {
+    const run = liveRun(runs, { sid, fgsRoot: registry.root, problemId: activeId });
+    if (run) return graphSnapshot(run);
+    if (!sid) return diskSnapshot(registry, activeId, cfg);
+    return inactivePayload();
+  }
+  const fallback = sid ? (sessionRuns.sort((a, b) => b.touchedAt - a.touchedAt)[0] ?? null) : lastRun(runs);
+  return fallback ? graphSnapshot(fallback) : inactivePayload();
 }
 
 function openStepsOf(graph) {
@@ -346,7 +518,10 @@ function graphSnapshot(run) {
     pluginGeneration: PLUGIN_GENERATION,
     buildTag: BUILD_TAG,
     sessionId: run.sid,
+    problemId: run.problemId ?? null,
     root: run.root,
+    workspaceDir: run.workspaceDir ?? null,
+    roundSeq: run.roundSeq ?? 0,
     role,
     roleLabel: roleLabel(role),
     reachable: run.reachable,
@@ -398,7 +573,7 @@ function defineFgsTool({ toolName, description, parameters, run, cfg }) {
   };
 }
 
-function registerTools(ctx, cfg, runs) {
+function registerTools(ctx, cfg, runs, registries) {
   const disposers = [];
   const register = (definition) => {
     disposers.push(ctx.tools.register(definition));
@@ -406,9 +581,13 @@ function registerTools(ctx, cfg, runs) {
   const makeTool = (spec) => defineFgsTool({ ...spec, cfg });
 
   const active = (exec) => {
-    const run = runFor(exec?.agent, cfg, runs, false);
+    const run = runFor(exec?.agent, cfg, runs, registries, false);
     if (!run) {
-      throw new Error('FGS 未启动：先调用 fgs_seed（或 /fgs init <brief>）种题。');
+      const registry = registryFor(exec?.agent, cfg, registries);
+      if (!registry?.getActive()) {
+        throw new Error('FGS 未启动：没有活动 Project。先 /fgs new <problemId> 或 /fgs switch <problemId>。');
+      }
+      throw new Error('FGS 未启动：先调用 fgs_seed（或 /fgs new <problemId> <brief> / /fgs init <brief>）种题。');
     }
     return run;
   };
@@ -417,7 +596,7 @@ function registerTools(ctx, cfg, runs) {
 
   register(makeTool({
     toolName: 'fgs_seed',
-    description: '启动 FGS 运行并种题：写入 fact_origin 与 goal_final。同一个 workspace 只种一次。',
+    description: '在活动 Project 上种题：写入 fact_origin 与 goal_final。先 /fgs new <problemId>。同一个 Project 只种一次。',
     parameters: {
       type: 'object',
       properties: {
@@ -433,7 +612,14 @@ function registerTools(ctx, cfg, runs) {
       if (typeof args.brief !== 'string' || args.brief.trim() === '') {
         return fail('fgs_seed 需要非空 brief。');
       }
-      const run = runFor(exec?.agent, cfg, runs, true);
+      const registry = registryFor(exec?.agent, cfg, registries);
+      if (!registry?.getActive()) {
+        return fail('FGS 未启动：没有活动 Project。先 /fgs new <problemId> 或 /fgs switch <problemId>。');
+      }
+      const run = runFor(exec?.agent, cfg, runs, registries, true);
+      if (!run) {
+        return fail('FGS 未启动：没有活动 Project。先 /fgs new <problemId> 或 /fgs switch <problemId>。');
+      }
       run.reachable = true;
       const graph = run.store.load();
       if (graph.facts.some((f) => f.id === 'fact_origin')) {
@@ -450,6 +636,7 @@ function registerTools(ctx, cfg, runs) {
       try {
         const next = run.controller.apply(op, graph);
         run.controller.commit(next);
+        syncProjectMeta(registry, run, next);
       } catch (error) {
         if (error instanceof WriteRejected) return fail(`种题拒收: ${error.message}`);
         throw error;
@@ -464,8 +651,12 @@ function registerTools(ctx, cfg, runs) {
     description: '只读查看 FGS 黑板状态：角色、目标是否满足、facts/steps 计数与 open steps。',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     run: (_args, exec) => {
-      const run = runFor(exec?.agent, cfg, runs, false);
-      if (!run) return ok('FGS 未启动（本会话尚未种题）。');
+      const registry = registryFor(exec?.agent, cfg, registries);
+      if (!registry?.getActive()) {
+        return ok('FGS 未启动（没有活动 Project：先 /fgs new <problemId> 或 /fgs switch <problemId>）。');
+      }
+      const run = runFor(exec?.agent, cfg, runs, registries, false);
+      if (!run) return ok(`FGS 未启动（Project ${registry.getActive()} 尚未种题）。`);
       const graph = run.store.load();
       // 图被外部删除 → 与「从未种题」同义，别报着缓存角色说自己在 Execute
       if (graph.facts.length === 0 && graph.goals.length === 0 && graph.steps.length === 0) {
@@ -473,8 +664,10 @@ function registerTools(ctx, cfg, runs) {
       }
       const role = derivedRole(graph);
       const lines = [
+        `Project: ${run.problemId}`,
         `角色: ${roleLabel(role)}`,
         `图: ${path.join(run.root, 'graph.yaml')}`,
+        `workspace: ${run.workspaceDir}`,
         `goal_final satisfied: ${goalSatisfied(graph) ? 'yes' : 'no'}`,
         `facts=${graph.facts.length} steps=${graph.steps.length} open=${openStepsOf(graph).length}`,
       ];
@@ -683,15 +876,17 @@ function registerTools(ctx, cfg, runs) {
       run.decideDraft = [];
       // 记住「本回合新开了哪些 step」：回合收口时不能把这些刚打开的 step 吞成观察 Fact，
       // 否则正常的「先规划、下一回合再执行」用法会把自己的第一步立刻消耗掉。
+      // 回合轴是本 run 的 roundSeq，不是全局 DSH turn（G8）。
       {
         const before = new Set(graph.steps.map((s) => s.id));
         const openedNow = working.steps.filter((s) => !before.has(s.id)).map((s) => s.id);
-        const openTurn = turnOf(ctx, exec?.agent);
-        if (openedNow.length > 0 && openTurn !== null) {
-          run.stepsOpenedTurn = openTurn;
+        const { round, limited } = observeRound(run, turnOf(ctx, exec?.agent));
+        if (openedNow.length > 0 && limited) {
+          run.stepsOpenedRound = round;
           run.stepsOpenedIds = new Set(openedNow);
         }
       }
+      syncProjectMeta(registryFor(exec?.agent, cfg, registries), run, working);
       refreshRole(run);
       const satisfied = goalSatisfied(working);
       if (satisfied && typeof exec?.concludeTurn === 'function') exec.concludeTurn();
@@ -755,9 +950,10 @@ function registerTools(ctx, cfg, runs) {
     },
     run: (args, exec) => {
       const run = active(exec);
-      const turn = turnOf(ctx, exec?.agent);
-      // CONTRACT §5：一轮只吃一个 open step
-      if (turn !== null && run.lastCommitTurn === turn) {
+      const { round, limited } = observeRound(run, turnOf(ctx, exec?.agent));
+      // CONTRACT §5：一轮只吃一个 open step。判据是本 Project run 的 roundSeq，
+      // 不用全局 turn 数字，避免同会话多题互相误拦（G8）。
+      if (limited && run.lastCommitRound === round) {
         return fail('一轮只吃一个 open step（CONTRACT §5）：本回合已经收束过一个 step，'
           + '请结束本回合，下一回合再推进下一个 open step。');
       }
@@ -780,7 +976,8 @@ function registerTools(ctx, cfg, runs) {
         run.controller.commit(next);
         run.execDraft = null;
         run.currentStepId = null;
-        if (turn !== null) run.lastCommitTurn = turn;
+        if (limited) run.lastCommitRound = round;
+        syncProjectMeta(registryFor(exec?.agent, cfg, registries), run, next);
         refreshRole(run);
         const remainder = openStepsOf(next);
         const tail = remainder.length > 0
@@ -860,16 +1057,17 @@ function resolveRoundStep(run, graph, stepId) {
  * 模型没调 fgs_commit_step 时，在回合收口处补一条显式观察 Fact。
  * 失败只记账不抛：收束失败绝不能阻断回合结束。
  */
-function forceCloseStep(run, turn) {
+function forceCloseStep(run, turn, registry) {
+  const { round, limited } = observeRound(run, turn);
   if (run.role !== 'execute') return false;
-  if (turn !== null && run.lastCommitTurn === turn) return false; // 本回合已收束过
+  if (limited && run.lastCommitRound === round) return false; // 本回合已收束过
   const graph = run.store.load();
   const resolved = pickStep(run, graph, run.execDraft?.stepId ?? run.currentStepId);
   if (resolved.error || !resolved.step) return false;
   const step = resolved.step;
   // 本轮刚由 Decide 打开的 step 还没轮到 Execute，回合收口不得把它吞成观察 Fact。
   // （否则「先规划、下一回合再执行」的正常用法下，第一个 step 会被立刻消费掉。）
-  if (turn !== null && run.stepsOpenedTurn === turn
+  if (limited && run.stepsOpenedRound === round
     && run.stepsOpenedIds instanceof Set && run.stepsOpenedIds.has(step.id)) {
     return false;
   }
@@ -885,7 +1083,8 @@ function forceCloseStep(run, turn) {
   run.controller.commit(next);
   run.execDraft = null;
   run.currentStepId = null;
-  if (turn !== null) run.lastCommitTurn = turn;
+  if (limited) run.lastCommitRound = round;
+  syncProjectMeta(registry, run, next);
   refreshRole(run);
   return true;
 }
@@ -919,6 +1118,7 @@ function opsFromJson(item) {
 export function apply(ctx, config = {}) {
   const cfg = normalizeConfig(config);
   const runs = new Map();
+  const registries = new Map();
 
   // 所有注册的 disposer 都收在这里，插件卸载/HMR 时统一撤销。
   // 实测：不交给 ctx.effect 持有的注册会在插件移除后继续生效
@@ -931,13 +1131,27 @@ export function apply(ctx, config = {}) {
   const ioSpecs = { decide: loadIoSchema('decide'), execute: loadIoSchema('execute') };
   const ioSchemaFor = (role) => ioSpecs[role] ?? null;
 
-  hold(registerTools(ctx, cfg, runs));
+  hold(registerTools(ctx, cfg, runs, registries));
 
-  // 角色隔离硬门：顺序无关、单调，任何越权调用都在 dispatch 层被拒
+  const activeRun = (agent) => {
+    const registry = registryFor(agent, cfg, registries);
+    const problemId = registry?.getActive() ?? null;
+    if (!problemId) return { registry, problemId: null, run: null };
+    const run = runs.get(runKey(sessionIdOf(agent), problemId)) ?? null;
+    return { registry, problemId, run };
+  };
+
+  // 角色隔离硬门：顺序无关、单调，任何越权调用都在 dispatch 层被拒。
+  // 没有活动 Project 时，改图工具（含 fgs_seed）一律拒；只放只读 fgs_status。
   hold(ctx.tools.guard((exec) => {
     const tool = exec?.name;
-    const run = runs.get(sessionIdOf(exec?.agent)) ?? null;
+    const { problemId, run } = activeRun(exec?.agent);
     if (GRAPH_TOOL_NAMES.includes(tool)) {
+      if (!problemId) {
+        return tool === 'fgs_status'
+          ? undefined
+          : 'FGS 未启动：没有活动 Project。先 /fgs new <problemId> 或 /fgs switch <problemId>。';
+      }
       if (!run) {
         return CONTROL_TOOLS.includes(tool)
           ? undefined
@@ -975,9 +1189,9 @@ export function apply(ctx, config = {}) {
     try {
       const agent = payload?.agent ?? payload;
       if (!agent) return;
-      const run = runs.get(sessionIdOf(agent));
+      const { registry, run } = activeRun(agent);
       if (!run) return;
-      forceCloseStep(run, turnOf(ctx, agent));
+      forceCloseStep(run, turnOf(ctx, agent), registry);
     } catch {
       /* 收束失败不得阻断回合结束 */
     }
@@ -998,8 +1212,9 @@ export function apply(ctx, config = {}) {
         if (!scope || typeof scope !== 'object') return '';
         const sid = sessionIdOf(scope);
         if (!sid || sid === 'unknown') return '';
-        const run = runs.get(sid);
-        if (!run) return '';
+        // 只注入本会话 × 活动 Project 的 run，不回退到别的题或别的会话。
+        const { run } = activeRun(scope);
+        if (!run || run.sid !== sid) return '';
         try {
           const graph = run.store.load();
           const current = graph.steps.find((s) => s.id === run.currentStepId) ?? null;
@@ -1022,40 +1237,110 @@ export function apply(ctx, config = {}) {
   ctx.inject(['commands'], (scoped) => {
     const commands = scoped?.commands ?? scoped;
     if (!commands?.register) return;
+    const handleNew = (agent, rawId, brief) => {
+      const registry = registryFor(agent, cfg, registries);
+      if (!registry) return { kind: 'error', text: '无法定位 workspace（agent 没有 cwd）。' };
+      const id = registry.normalizeId(rawId);
+      if (!registry.isValidId(id)) {
+        return { kind: 'error', text: `problemId 非法: ${rawId ?? ''}（须为 [a-z0-9_-]{1,64}）` };
+      }
+      try {
+        if (!registry.exists(id)) {
+          const title = brief ? brief.split('\n')[0].slice(0, 120) : id;
+          registry.create({ id, title });
+        } else if (!brief) {
+          return { kind: 'error', text: `Project 已存在: ${id}` };
+        }
+        registry.setActive(id);
+      } catch (error) {
+        return { kind: 'error', text: error.message };
+      }
+      if (!brief) {
+        return { kind: 'success', text: `已建立 Project ${id} → ${registry.projectRoot(id)}` };
+      }
+      const fresh = runFor(agent, cfg, runs, registries, true, id);
+      if (!fresh) return { kind: 'error', text: `无法启动 Project ${id}。` };
+      fresh.reachable = true;
+      const graph = fresh.store.load();
+      if (graph.facts.some((f) => f.id === 'fact_origin')) {
+        return { kind: 'error', text: `已经种过题: ${path.join(fresh.root, 'graph.yaml')}` };
+      }
+      try {
+        const next = fresh.controller.apply(seedOriginOp({ title: '题目信息:', content: brief }), graph);
+        fresh.controller.commit(next);
+        syncProjectMeta(registry, fresh, next);
+      } catch (error) {
+        return { kind: 'error', text: `种题失败: ${error.message}` };
+      }
+      refreshRole(fresh);
+      return { kind: 'success', text: `已种题 → ${path.join(fresh.root, 'graph.yaml')}` };
+    };
+
     hold(commands.register({
       name: 'fgs',
-      description: 'FGS 黑板：init <brief> | status | graph | reopen <reason> | off | path',
-      input: { hint: 'init <brief> | status | graph | reopen <reason> | off | path' },
+      description: 'FGS 黑板：new <problemId> [brief] | switch <problemId> | list | init <brief> | status | graph | path | reopen <reason> | off',
+      input: { hint: 'new <problemId> [brief] | switch <problemId> | list | init <brief> | status | graph | path | reopen <reason> | off' },
       handler: (invocation) => {
         const raw = String(invocation?.rawInput ?? '').trim();
         const [sub, ...rest] = raw.split(/\s+/);
         const restText = rest.join(' ').trim();
         const agent = invocation?.agent;
-        const run = runFor(agent, cfg, runs, false);
+        const run = runFor(agent, cfg, runs, registries, false);
         switch (sub) {
+          case 'new': {
+            const rawId = rest[0];
+            const brief = rest.slice(1).join(' ').trim();
+            if (!rawId) return { kind: 'error', text: '用法: /fgs new <problemId> [brief]' };
+            return handleNew(agent, rawId, brief);
+          }
+          case 'switch': {
+            const rawId = rest[0];
+            if (!rawId) return { kind: 'error', text: '用法: /fgs switch <problemId>' };
+            const registry = registryFor(agent, cfg, registries);
+            if (!registry) return { kind: 'error', text: '无法定位 workspace（agent 没有 cwd）。' };
+            const id = registry.normalizeId(rawId);
+            if (!registry.exists(id)) return { kind: 'error', text: `Project 不存在: ${id}` };
+            try {
+              registry.setActive(id);
+            } catch (error) {
+              return { kind: 'error', text: error.message };
+            }
+            return { kind: 'success', text: `已切换活动 Project → ${id}` };
+          }
+          case 'list': {
+            const registry = registryFor(agent, cfg, registries);
+            if (!registry) return { kind: 'error', text: '无法定位 workspace（agent 没有 cwd）。' };
+            const items = registry.list();
+            if (items.length === 0) {
+              return { kind: 'success', text: '（无 Project）用 /fgs new <problemId> [brief] 建立。' };
+            }
+            const activeId = registry.getActive();
+            const lines = items.map((item) => {
+              const mark = item.id === activeId ? '*' : ' ';
+              try {
+                const store = new GraphStore(registry.projectRoot(item.id), cfg);
+                const graph = store.load();
+                const seeded = graph.facts.length > 0 || graph.goals.length > 0 || graph.steps.length > 0;
+                const role = seeded ? roleLabel(derivedRole(graph)) : 'unseeded';
+                const open = openStepsOf(graph).length;
+                const satisfied = goalSatisfied(graph) ? 'yes' : 'no';
+                return `${mark} ${item.id}  title=${item.title}  role=${role}  open=${open}  satisfied=${satisfied}  state=${item.state}`;
+              } catch (error) {
+                return `${mark} ${item.id}  [读取失败: ${error.message}]`;
+              }
+            });
+            return { kind: 'success', text: lines.join('\n') };
+          }
           case 'init': {
             if (!restText) return { kind: 'error', text: '用法: /fgs init <题目 brief>' };
-            const fresh = runFor(agent, cfg, runs, true);
-            fresh.reachable = true;
-            const graph = fresh.store.load();
-            if (graph.facts.some((f) => f.id === 'fact_origin')) {
-              return { kind: 'error', text: `已经种过题: ${path.join(fresh.root, 'graph.yaml')}` };
-            }
-            try {
-              const next = fresh.controller.apply(seedOriginOp({ title: '题目信息:', content: restText }), graph);
-              fresh.controller.commit(next);
-            } catch (error) {
-              return { kind: 'error', text: `种题失败: ${error.message}` };
-            }
-            refreshRole(fresh);
-            return { kind: 'success', text: `已种题 → ${path.join(fresh.root, 'graph.yaml')}` };
+            return handleNew(agent, 'default', restText);
           }
           case 'status': {
             if (!run) return { kind: 'success', text: 'FGS 未启动。' };
             const snap = graphSnapshot(run);
             return {
               kind: 'success',
-              text: `角色 ${snap.role} | facts=${snap.counts.facts} steps=${snap.counts.steps} open=${snap.counts.open} | satisfied=${snap.satisfied}`,
+              text: `Project ${snap.problemId} | 角色 ${snap.role} | facts=${snap.counts.facts} steps=${snap.counts.steps} open=${snap.counts.open} | satisfied=${snap.satisfied}`,
             };
           }
           case 'graph': {
@@ -1073,6 +1358,7 @@ export function apply(ctx, config = {}) {
               const graph = run.store.load();
               const next = run.controller.apply(reopenOp({ goalId: 'goal_final', reason: restText }), graph);
               run.controller.commit(next);
+              syncProjectMeta(registryFor(agent, cfg, registries), run, next);
             } catch (error) {
               return { kind: 'error', text: `reopen 失败: ${error.message}` };
             }
@@ -1081,13 +1367,13 @@ export function apply(ctx, config = {}) {
           }
           case 'off': {
             if (!run) return { kind: 'success', text: 'FGS 本就未启动。' };
-            runs.delete(sessionIdOf(agent));
+            runs.delete(runKey(run.sid, run.problemId));
             return { kind: 'success', text: '已退出 FGS；图文件保留在磁盘。' };
           }
           default:
             return {
               kind: 'error',
-              text: '子命令: init <brief> | status | graph | path | reopen <reason> | off',
+              text: '子命令: new <problemId> [brief] | switch <problemId> | list | init <brief> | status | graph | path | reopen <reason> | off',
             };
         }
       },
@@ -1106,15 +1392,21 @@ export function apply(ctx, config = {}) {
         handler: (req, res) => {
           let body;
           try {
-            // 面板按会话取自己的黑板；没有 sessionId 时回退到「最近一个 run」（运维/curl 方便）
+            // ?problemId= 看指定题；?sessionId= 看该会话的活动题；都没有则回退活动 Project
+            // （没有活动 run 时再退到最近一个 run，方便 curl）。
             let sid = null;
+            let problemParam = null;
             try {
-              sid = new URL(req?.url ?? '/', 'http://localhost').searchParams.get('sessionId');
+              const params = new URL(req?.url ?? '/', 'http://localhost').searchParams;
+              sid = params.get('sessionId');
+              problemParam = params.get('problemId');
             } catch {
               sid = null;
+              problemParam = null;
             }
-            const run = sid ? (runs.get(sid) ?? null) : lastRun(runs);
-            body = JSON.stringify(run ? graphSnapshot(run) : inactivePayload());
+            body = JSON.stringify(resolveHttpSnapshot({
+              runs, registries, cfg, sessionId: sid, problemId: problemParam,
+            }));
           } catch (error) {
             body = JSON.stringify({ active: false, error: String(error?.message ?? error) });
           }
